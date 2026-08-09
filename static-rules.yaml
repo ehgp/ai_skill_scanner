@@ -1,0 +1,481 @@
+# Rules for the in-house `static` scanner stage.
+#
+# Everything the static scan looks for lives here, so you can tune it without
+# touching skill-scanner.py. Set `enabled: false` on any rule to turn that
+# keyword off, or delete/comment entries from the plain lists at the bottom.
+#
+# Patterns are Python regular expressions, matched case-insensitively and in
+# MULTILINE mode. Each is written as a YAML literal block (`|-`) so backslashes
+# and quotes are taken exactly as typed -- no escaping games.
+#
+# This file is REQUIRED. If it is missing or a pattern fails to compile the
+# scanner refuses to run rather than silently scanning with no rules, since a
+# static stage with nothing enabled would pass every artifact.
+
+# ---------------------------------------------------------------------------
+# What gets read
+# ---------------------------------------------------------------------------
+scan_scope:
+  # Files with these extensions are scanned. Extensionless files are scanned
+  # too; anything else (binaries, images, archives) is skipped.
+  text_extensions:
+    [.md, .txt, .json, .yaml, .yml, .toml, .ini, .cfg, .py, .js, .ts, .jsx,
+     .tsx, .sh, .ps1, .bat, .cmd, .xml, .html, .css]
+  # Markdown gets special handling: exec-payload rules run against the RAW
+  # text (fenced code blocks are exactly where payloads hide), while the
+  # external-API policy runs against prose with fences stripped, so ordinary
+  # documentation examples do not trip it.
+  markdown_extensions: [.md, .markdown]
+  max_file_bytes: 2000000
+
+# ---------------------------------------------------------------------------
+# High-confidence rules: a single match rejects the artifact
+# ---------------------------------------------------------------------------
+high_confidence:
+  - id: curl-pipe-shell
+    enabled: true
+    description: Downloads a script and pipes it straight into a shell
+    pattern: |-
+      curl\s+[^|>\n]*\|\s*(bash|sh)\b
+
+  - id: wget-pipe-shell
+    enabled: true
+    description: Downloads a script with wget and pipes it into a shell
+    pattern: |-
+      wget\s+[^|>\n]*\|\s*(bash|sh)\b
+
+  - id: iwr-pipe-iex
+    enabled: true
+    description: Windows equivalent - fetches a payload and evaluates it
+    pattern: |-
+      Invoke-WebRequest.+\|\s*iex\b
+
+  - id: invoke-expression
+    enabled: true
+    description: PowerShell arbitrary-code evaluation
+    pattern: |-
+      Invoke-Expression\b
+
+  - id: eval-call
+    enabled: true
+    description: Evaluates a string as code
+    pattern: |-
+      \beval\s*\(
+
+  - id: os-system
+    enabled: true
+    description: Python shell-out via os.system
+    pattern: |-
+      \bos\.system\s*\(
+
+  - id: python-subprocess
+    enabled: true
+    description: Python subprocess execution
+    pattern: |-
+      \bsubprocess\.(Popen|run)\s*\(
+
+  - id: node-child-process
+    enabled: true
+    description: Node.js process execution
+    pattern: |-
+      \bchild_process\.(exec|execSync|spawn|spawnSync)\s*\(
+
+  # Naming a shell is not a finding - "requires PowerShell 7", a ```powershell
+  # fence tag, and a markdown table cell are all harmless. These four rules
+  # fire only on INVOCATION, and can be toggled independently.
+  - id: powershell-piped-input
+    enabled: true
+    description: Something piped into powershell/pwsh (curl ... | powershell)
+    pattern: |-
+      [^\s|]\s*\|\s*(?:powershell|pwsh)(?:\.exe)?\b(?!\s*\|)
+
+  - id: powershell-command-switch
+    enabled: true
+    description: powershell/pwsh invoked with a command, encoded payload, or script switch
+    pattern: |-
+      \b(?:powershell|pwsh)(?:\.exe)?\b[^\n]{0,160}?[\s'"](?:-|/)(?:c|command|e|ec|enc|encodedcommand|f|file|ep|executionpolicy|nop|noprofile|noni|noninteractive|w|windowstyle|argumentlist)\b
+
+  - id: powershell-inline-command
+    enabled: true
+    description: powershell/pwsh invoked with an inline quoted command
+    pattern: |-
+      \b(?:powershell|pwsh)(?:\.exe)?\s+["'][^"'\n]{2,}["']
+
+  - id: powershell-script-file
+    enabled: true
+    description: powershell/pwsh invoked on a .ps1 script
+    pattern: |-
+      \b(?:powershell|pwsh)(?:\.exe)?\s+[^\s\-][^\n]{0,120}?\.ps1\b
+
+  - id: ssh-key-access
+    enabled: true
+    description: Touches SSH private keys or authorized_keys
+    pattern: |-
+      \bssh\b.*\b(id_rsa|authorized_keys)\b
+
+  # Two things this rule has to get right. First, the trailing boundary:
+  # `/\b` cannot match `rm -rf /` at all, because a slash followed by a space
+  # is not a word boundary - the original rule silently missed the single most
+  # destructive form. Second, the target must be the root itself or a whole
+  # system directory; a deeper path is ordinary housekeeping, and matching it
+  # would flag every Dockerfile that runs `rm -rf /var/lib/apt/lists/*`.
+  # Flags on either side of the path are tolerated.
+  - id: rm-rf-root
+    enabled: true
+    description: Recursive delete of the filesystem root or a system directory
+    pattern: |-
+      \brm\s+(?:-[-\w]+\s+)*-(?:rf|fr)\b(?:\s+-[-\w]+)*\s+["']?/(?:etc|usr|bin|sbin|lib|lib64|boot|dev|proc|sys|var|home|root|opt|srv)?(?:["'\s;&|]|\*|$)
+
+# ---------------------------------------------------------------------------
+# Contextual rules: env/secret access is only a finding when it appears
+# alongside networking, shelling, or exfiltration context in the same file.
+# (Not applied to Markdown, where such words are usually documentation.)
+# ---------------------------------------------------------------------------
+env_access:
+  - id: python-os-environ
+    enabled: true
+    description: Reads process environment (Python)
+    pattern: |-
+      \bos\.environ\b
+
+  - id: node-process-env
+    enabled: true
+    description: Reads process environment (Node.js)
+    pattern: |-
+      \bprocess\.env\b
+
+  - id: getenv
+    enabled: true
+    description: Reads process environment (generic)
+    pattern: |-
+      \bgetenv\s*\(
+
+secret_names:
+  - id: name-token
+    enabled: true
+    description: Mentions a token
+    pattern: |-
+      \btoken\b
+
+  - id: name-secret
+    enabled: true
+    description: Mentions a secret
+    pattern: |-
+      \bsecret\b
+
+  - id: name-api-key
+    enabled: true
+    description: Mentions an API key
+    pattern: |-
+      \bapi[_-]?key\b
+
+  - id: name-password
+    enabled: true
+    description: Mentions a password
+    pattern: |-
+      \bpassword\b
+
+  - id: name-passwd
+    enabled: true
+    description: Mentions passwd
+    pattern: |-
+      \bpasswd\b
+
+suspicious_context:
+  - id: ctx-python-requests
+    enabled: true
+    description: Python requests library
+    pattern: |-
+      \brequests\.
+
+  - id: ctx-httpx
+    enabled: true
+    description: Python httpx library
+    pattern: |-
+      \bhttpx\.
+
+  - id: ctx-urllib
+    enabled: true
+    description: Python urllib
+    pattern: |-
+      \burllib\.
+
+  - id: ctx-fetch
+    enabled: true
+    description: fetch() network call
+    pattern: |-
+      \bfetch\s*\(
+
+  - id: ctx-axios
+    enabled: true
+    description: axios HTTP client
+    pattern: |-
+      \baxios\.
+
+  - id: ctx-curl
+    enabled: true
+    description: curl
+    pattern: |-
+      \bcurl\b
+
+  - id: ctx-wget
+    enabled: true
+    description: wget
+    pattern: |-
+      \bwget\b
+
+  - id: ctx-os-system
+    enabled: true
+    description: os.system shell-out
+    pattern: |-
+      \bos\.system\s*\(
+
+  - id: ctx-subprocess
+    enabled: true
+    description: subprocess module
+    pattern: |-
+      \bsubprocess\.
+
+  - id: ctx-child-process
+    enabled: true
+    description: Node child_process module
+    pattern: |-
+      \bchild_process\.
+
+  - id: ctx-eval
+    enabled: true
+    description: eval()
+    pattern: |-
+      \beval\s*\(
+
+  - id: ctx-exec
+    enabled: true
+    description: exec()
+    pattern: |-
+      \bexec\s*\(
+
+  - id: ctx-open-ssh-key
+    enabled: true
+    description: Opens an SSH key file
+    pattern: |-
+      \bopen\s*\([^)]*(authorized_keys|id_rsa|id_dsa)
+
+  - id: ctx-base64-decode
+    enabled: true
+    description: base64 decoding (payload staging)
+    pattern: |-
+      \bbase64\s+-d\b
+
+# ---------------------------------------------------------------------------
+# External-API policy: does the artifact REQUIRE a third-party API, gateway,
+# or credential broker to function? These patterns only produce a finding when
+# a dependency_marker (below) also appears -- a bare mention is not enough.
+# Any URL outside allowed_domains is a finding on its own.
+# ---------------------------------------------------------------------------
+external_api:
+  - id: api-subdomain
+    enabled: true
+    description: References an api.* host
+    pattern: |-
+      \bapi\.[A-Za-z0-9.-]+\b
+
+  - id: gateway-subdomain
+    enabled: true
+    description: References a gateway.* host
+    pattern: |-
+      \bgateway\.[A-Za-z0-9.-]+\b
+
+  - id: ctrl-subdomain
+    enabled: true
+    description: References a ctrl.* host
+    pattern: |-
+      \bctrl\.[A-Za-z0-9.-]+\b
+
+  - id: connect-subdomain
+    enabled: true
+    description: References a connect.* host
+    pattern: |-
+      \bconnect\.[A-Za-z0-9.-]+\b
+
+  - id: oauth
+    enabled: true
+    description: OAuth flow
+    pattern: |-
+      \boauth\b
+
+  - id: managed-oauth
+    enabled: true
+    description: Managed OAuth broker
+    pattern: |-
+      \bmanaged oauth\b
+
+  - id: third-party-api
+    enabled: true
+    description: States a third-party API dependency
+    pattern: |-
+      \bthird-?party api\b
+
+  - id: third-party-service
+    enabled: true
+    description: States a third-party service dependency
+    pattern: |-
+      \bthird-?party service\b
+
+  - id: external-api
+    enabled: true
+    description: States an external API dependency
+    pattern: |-
+      \bexternal api\b
+
+  - id: external-service
+    enabled: true
+    description: States an external service dependency
+    pattern: |-
+      \bexternal service\b
+
+  - id: passthrough-proxy
+    enabled: true
+    description: Passthrough proxy to third-party APIs
+    pattern: |-
+      \bpassthrough proxy\b
+
+  - id: proxy-direct-access
+    enabled: true
+    description: Proxy for direct access to third-party APIs
+    pattern: |-
+      \bproxy for direct access to third-?party apis\b
+
+  - id: api-gateway
+    enabled: true
+    description: API gateway dependency
+    pattern: |-
+      \bapi gateway\b
+
+  - id: gateway-word
+    enabled: true
+    description: Gateway dependency
+    pattern: |-
+      \bgateway\b
+
+  - id: middleware-api
+    enabled: true
+    description: Middleware API dependency
+    pattern: |-
+      \bmiddleware api\b
+
+  - id: control-plane
+    enabled: true
+    description: External control plane
+    pattern: |-
+      \bcontrol plane\b
+
+  - id: maton
+    enabled: true
+    description: Maton middleware
+    pattern: |-
+      \bmaton\b
+
+  - id: api-key-phrase
+    enabled: true
+    description: Requires an API key
+    pattern: |-
+      \bapi key\b
+
+  - id: bearer-auth
+    enabled: true
+    description: Sends a bearer token
+    pattern: |-
+      \bauthorization:\s*bearer\b
+
+# Phrases that turn an external_api match into an actual finding: they signal
+# the artifact REQUIRES the service rather than merely mentioning it.
+# Comment out any line to stop treating it as a dependency signal.
+dependency_markers:
+  - require
+  - requires
+  - all requests require
+  - must
+  - use this skill when users want to interact with external services
+  - connect to
+  - provided by
+  - api gateway
+  - base url
+  - "authorization: bearer"
+  - oauth
+  - managed oauth
+  - api key
+  - passthrough proxy
+  - gateway automatically injects
+
+# ---------------------------------------------------------------------------
+# Domains whose URLs are NOT treated as an external dependency.
+# Subdomains are covered automatically: "python.org" also allows
+# "docs.python.org". Deliberately excluded: raw.githubusercontent.com and
+# other raw-file hosts, which are a real payload-delivery vector.
+# ---------------------------------------------------------------------------
+allowed_domains:
+  # Source hosting and this scanner's own marketplace
+  - github.com
+  - clawhub.ai
+  - clawhub.com
+
+  # Agent-platform documentation
+  - anthropic.com
+  - claude.com
+  - claude.ai
+  - modelcontextprotocol.io
+  - openai.com
+
+  # Placeholder hosts that can never be a real endpoint: RFC 2606 reserves
+  # these for documentation, so a URL using one is an example, not a
+  # dependency. Subdomains (my-proxy.example.com) are covered.
+  - example.com
+  - example.org
+  - example.net
+  - localhost
+  - 127.0.0.1
+
+  # README badge images
+  - shields.io
+
+  # Language and framework documentation
+  - python.org
+  - nodejs.org
+  - go.dev
+  - rust-lang.org
+  - typescriptlang.org
+  - developer.mozilla.org
+  - learn.microsoft.com
+  - docs.microsoft.com
+  - developer.chrome.com
+  - readthedocs.io
+  - readthedocs.org
+  - docs.docker.com
+  - kubernetes.io
+
+  # Standards, specs, and licenses
+  - w3.org
+  - ietf.org
+  - rfc-editor.org
+  - json-schema.org
+  - schema.org
+  - spdx.org
+  - semver.org
+  - keepachangelog.com
+  - opensource.org
+  - apache.org
+  - gnu.org
+  - creativecommons.org
+  - contributor-covenant.org
+
+  # General reference
+  - wikipedia.org
+  - stackoverflow.com
+
+  # Package registries. Remove these if you want a skill that installs
+  # dependencies at runtime to be flagged.
+  - npmjs.com
+  - npmjs.org
+  - pypi.org
+  - crates.io
+  - rubygems.org

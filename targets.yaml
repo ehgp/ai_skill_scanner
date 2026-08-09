@@ -1,0 +1,68 @@
+# Scan targets and settings for skill-scanner.py.
+#
+# Paste links here (ClawHub skill URLs or GitHub repo URLs) or local paths
+# (ZIPs, skill/plugin dirs, MCP config JSON files). Everything dropped into
+# candidates/ is ALSO scanned automatically; this file is for link lists and
+# pinned local paths. Secrets do NOT go here -- they live in .env.
+#
+# Entry forms:
+#   - https://clawhub.ai/owner/skill-slug
+#   - https://github.com/owner/skills-repo
+#   - ./candidates/some-skill.zip
+#   - C:/path/to/local/skill-dir
+#   - url: https://clawhub.ai/owner/skill-slug
+#     slug: custom-report-name
+#     zip_name: custom-file.zip
+
+settings:
+  # Reject on findings at or above: critical|high|medium|low|info
+  fail_on: high
+
+  # Master switch for LLM-backed analysis in every engine that supports it.
+  # Needs LLM config in .env (see .env.example); has no effect without it.
+  llm: false
+
+  # Legacy shortcut for cisco.osv below; kept so older configs keep working.
+  osv: false
+
+  # ---- Scanner stages -----------------------------------------------------
+  # Turn whole engines on or off. Disabling is a deliberate choice, so it does
+  # NOT fail the verdict the way an engine that COULD NOT run does -- but each
+  # disabled stage is recorded in the report's coverage_notes, because an
+  # approval with engines switched off is weaker evidence than a full pass.
+  # Override per run with --skip a,b or --only a,b.
+  scanners:
+    gendigital: true       # ClawHub reputation lookup (ClawHub URLs only)
+    static: true           # in-house URL / credential / payload policy scan
+    cisco: true            # Cisco AI Defense skill-scanner
+    skillspector: true     # NVIDIA SkillSpector
+    snyk_agent_scan: true  # Snyk agent-scan (skills + MCP configs)
+    snyk_sca: true         # Snyk CLI dependency CVEs
+    snyk_code: true        # Snyk CLI SAST
+
+  # ---- Cisco optional analyzers -------------------------------------------
+  # Cisco's core (static + YARA + bytecode + pipeline) always runs when the
+  # cisco stage is on; these are the extras. Ones needing a key stay dormant
+  # until that key is present in .env.
+  cisco:
+    behavioral: false       # AST dataflow analysis (offline)
+    llm: false              # semantic analysis (also needs settings.llm + key)
+    osv: false             # OSV.dev dependency lookups (network, no key)
+    virustotal: false       # needs CISCO_VIRUSTOTAL_API_KEY
+    aidefense: false        # needs CISCO_AI_DEFENSE_API_KEY
+    trigger: false         # trigger-specificity analysis
+    meta: false            # meta-analyzer over findings (LLM, slower)
+    adjudicate: false      # LLM re-checks each HIGH/CRITICAL (slower)
+
+  # ---- SkillSpector options ------------------------------------------------
+  skillspector:
+    llm: false              # semantic analysis (also needs settings.llm + provider)
+
+targets:
+  - https://clawhub.ai/ivangdavila/docker-compose
+  - https://clawhub.ai/HonestQiao/dockerfile-generator
+  - https://clawhub.ai/steipete/github
+  - https://clawhub.ai/jgarrison929/database-operations
+  - https://clawhub.ai/wpank/code-review
+  - https://github.com/obra/superpowers
+  - https://github.com/Yeachan-Heo/oh-my-claudecode
