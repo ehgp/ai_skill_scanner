@@ -37,6 +37,7 @@ optional tokens in `.env` unlock the cloud engines (see below).
 | `snyk_agent_scan` | [snyk/agent-scan](https://github.com/snyk/agent-scan) (`snyk-agent-scan==0.5.16`) | skill + MCP-config prompt-injection / toxic-flow analysis | `SNYK_TOKEN` |
 | `snyk_sca` | [snyk/cli](https://github.com/snyk/cli) `snyk test --all-projects` | CVEs in dependency manifests | `snyk` CLI, auth |
 | `snyk_code` | [snyk/cli](https://github.com/snyk/cli) `snyk code test` | SAST on bundled source code | `snyk` CLI, auth, Snyk Code enabled |
+| `clawhub_audit` | ClawHub API `GET /api/v1/skills/{slug}/scan?owner=` | the registry's own audit for ClawHub URLs, copied to `audit.registry`; never fails the verdict, skipped when the API is unreachable | network |
 
 Unconfigured cloud stages are **skipped with a recorded reason** — with two
 fail-closed exceptions: any artifact carrying an MCP config (standalone or
@@ -62,6 +63,75 @@ uv run skill-scanner.py --fail-on low --llm
 
 `uv run` resolves the inline dependencies (`requests`, `pyyaml`); plain
 `python skill-scanner.py` works too if both are installed.
+
+GitHub targets are fetched through the GitHub API, which allows only 60
+unauthenticated requests per hour: export `GITHUB_TOKEN` (or `GH_TOKEN`), e.g.
+`GITHUB_TOKEN="$(gh auth token)"`, to raise that to 5,000. The token is sent
+only to `api.github.com`, the remaining quota is printed once per run, and a
+rate-limited download is reported as `Download failed: GitHub API rate limit;
+set GITHUB_TOKEN` rather than a generic runtime error.
+
+## Audit block
+
+`status` (approved/rejected) answers "did anything reach `fail_on`?" — at the
+default threshold nearly every real repo is rejected, because one README link
+outside the allowlist is enough. Every report therefore also carries
+`report["audit"]`, a ClawHub-style summary built from the same stage data
+(`build_audit` in `skill-scanner.py`, tunables in the `audit:` block of
+`static-rules.yaml`). It is additive: it never changes `status`,
+`failure_reasons`, or what `fail_on` rejects. The console prints it as one
+`Audit:` line per target, and `reports/summary.json` rows gain `audit_status`
+and `risk_level`.
+
+`audit.status` is the first class that applies:
+
+| Status | Meaning | Drivers (in `audit.drivers`) |
+|---|---|---|
+| `not-scanned` | the scan errored (download, size cap, runtime) or no stage ran | — |
+| `review` | read before installing | `danger-code:<rules>` (a non-command `high_confidence` rule such as `curl-pipe-shell`, `eval-call`, `rm-rf-root` in a non-doc file), `secret-near-net`, `cisco:high+`, `skillspector:do-not-install`, `gendigital:<sev>`, `snyk-agent`, `snyk-sca:vulns`, `registry:<status>`; `cisco:failed` / `skillspector:failed` (failed `fail_on` below those markers, or errored); `rejected:coverage` (rejected only because a required scanner could not run) |
+| `runs-commands` | spawns processes, expected for a tool | `cmd-code:<rules>` (rules listed in `audit.command_rules`), `exec-doc:<rules>` (exec lines only in docs, e.g. README install lines), `snyk-code` |
+| `links-only` | nothing beyond URLs outside the allowlist or a Snyk install error | `external-urls`, `snyk-sca-error`, `snyk-code-error` |
+| `clean` | no finding at all | — |
+
+`not-a-skill-package` is added as an informational driver for unknown
+packaging; it does not change the status.
+
+`audit.risk_level` (low / medium / high / critical) is the **blast radius** —
+what the artifact can reach if it misbehaves, regardless of intent. It sums
+`audit.risk_weights` over the non-empty axes of `audit.blast_radius` and maps
+the score through `audit.risk_levels`:
+
+| Axis | Source (code files only, per the doc/code split) |
+|---|---|
+| `shell` | `high_confidence` rule ids hit in code (`shell_in_docs` lists doc-only hits, unweighted) |
+| `network_hosts` | every URL host in code files, allowlisted or not (`doc_link_hosts` counts doc links, unweighted) |
+| `credentials_env` | env vars read in code (`os.environ`, `getenv`, `process.env`, `$env:`, secret-looking `$NAME`) plus `rule:<id>` for secret-near-network hits |
+| `hooks` | `hooks.json` files and `settings*.json` files containing `"hooks"` |
+| `mcp_servers` | the embedded MCP config, or the `mcp_config` / `mcp_server` kind |
+| `files_outside_repo` | code hits on `audit.outside_repo_rules` (`ssh-key-access`, `rm-rf-root`) |
+
+`fail_on` and `risk_level` measure different things and can disagree: a
+plugin that shells out via `subprocess` and ships a `hooks.json` is
+`runs-commands` with risk `high` (it can do a lot), while a doc-only skill flagged by SkillSpector
+is `review` with risk `low` (suspicious text, little reach). Use `status` for
+"does it pass the gate", `audit.status` for "what do I do next", and
+`risk_level` for "how bad is it if I'm wrong".
+
+`audit.needs` lists what the artifact asks of you: `binaries` (SKILL.md
+frontmatter `requires.bins` / `anyBins`, plus the interpreter each code rule
+implies via `audit.rule_binaries`), `keys` (secret-looking env names read in
+code plus frontmatter `requires.env`), and `accounts` (the service prefix of
+each secret-looking key, e.g. `OPENAI_API_KEY` → `openai`).
+
+`audit.registry` is `null` except for ClawHub targets, where it holds the
+registry's audit (`status`: clean / suspicious / malicious / pending / error,
+`has_warnings`, per-scanner statuses, `version`, `endpoint`) and
+`disagreement`: `true` when ClawHub flags the release but our scanners do not
+reach `review`, or the reverse. A ClawHub flag raises `audit.status` to
+`review`. The lookup is `GET https://clawhub.ai/api/v1/skills/{slug}/scan`
+(public, keyless; read limit 3,000/min per IP per the OpenAPI at
+`https://clawhub.ai/api/v1/openapi.json`); `owner` is undocumented but
+required when several publishers share a slug (a bare slug returns 409).
 
 ## Tuning the static rules
 
@@ -107,11 +177,24 @@ After editing rules, check them against known-good and known-bad text:
 
 ```bash
 uv run tests/test_static_rules.py
+uv run tests/test_scanner.py
 ```
 
-It asserts that each sample matches the rule it should, that ordinary prose
-and documentation don't match anything, and that the domain allowlist accepts
-doc hosts while still flagging raw-file and webhook hosts.
+The first asserts that each sample matches the rule it should, that ordinary
+prose and documentation don't match anything, and that the domain allowlist
+accepts doc hosts while still flagging raw-file and webhook hosts. The second
+covers scanner plumbing: the GitHub token header, report naming, and the
+doc/code split below.
+
+### Exec patterns in documentation
+
+A `high_confidence` hit in a documentation file — `doc_extensions` under
+`scan_scope` (`.md`, `.mdx`, `.txt`, `.rst`, `.adoc`, `.html`) — is recorded
+with `in_docs: true` and listed under `exec_patterns_in_docs` in the static
+stage's data, but does **not** reject on its own: a README install line
+(`curl … | sh`) is not a payload. The same pattern in a script, config, or
+any other code file rejects exactly as before. Nothing is dropped from the
+report; approved targets with doc hits print a `(docs)` line.
 
 ### A note on the shell-invocation rule
 
@@ -234,8 +317,52 @@ uv run update-scanners.py
 2. **`targets.yaml`** — paste link lists (ClawHub skill URLs or GitHub repo
    URLs, fetched as default-branch zipballs) or local paths; also holds
    default settings (`fail_on`, `llm`, `osv`). Secrets do NOT go here — they
-   live in `.env`.
+   live in `.env`. GitHub targets are reported as `owner__repo` (report,
+   extraction dir, and approved/rejected ZIP), so `a/skills` and `b/skills`
+   never overwrite each other; ClawHub and local targets keep the plain name.
 3. **CLI arguments** — when given, *only* those targets are scanned.
+
+## Radar
+
+[radar.py](radar.py) is a weekly feed diff that finds new candidates for you
+(stdlib only, ~10 s): today's top 100 gittrend.io repos in the topics
+`ai-skills`, `mcp`, `ai-coding-assistant`, `ai-agent` and `ai-memory`, the
+curatedai.net tool directory, and, when `ARTIFICIAL_ANALYSIS_API_KEY` is set
+(free key, in the environment or `.env`), Artificial Analysis model scores for
+the models in the Vault `agent-model-roster.md`. Each run diffs against
+`radar/state.json`, so a second run reports 0 new items.
+
+```bash
+uv run radar.py                         # all sources; AA skipped without a key
+uv run radar.py --sources gittrend      # one source
+uv run radar.py --scan                  # then scan the new targets
+uv run tests/test_radar.py              # diff logic check
+```
+
+Output: `reports/radar/RADAR-<date>_<time>.md` (new repos per topic, rising
+repos, new tools, roster deltas, a ready `uv run skill-scanner.py …` line) and
+`reports/radar/targets-<date>_<time>.txt` with the new **skill-like** GitHub
+repos (topic `ai-skills`/`mcp`, or a skills/MCP/claude-code/codex topic tag),
+minus repos that already have a report. The same repos accumulate in
+`radar/candidates.yaml` in `targets.yaml` entry form; they are never merged
+into `targets.yaml` automatically. The first run is a baseline: everything is new
+(~400 repos, ~250 targets). A source that fails is named in the digest and
+never blocks the others. Feed contracts and their traps are in
+[radar/SOURCES.md](radar/SOURCES.md).
+
+Weekly schedule (Monday 07:00, S4U, no wrapper script). Run this **once from
+an elevated PowerShell**. It is documented here and has not been registered:
+
+```powershell
+$a = New-ScheduledTaskAction -Execute (Get-Command uv).Source -Argument 'run radar.py' -WorkingDirectory "$HOME\projects\personal\ai_skill_scanner"
+$t = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At 7:00
+$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
+$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+Register-ScheduledTask -TaskName ai-radar -Action $a -Trigger $t -Principal $p -Settings $s
+```
+
+Check it with `schtasks /query /tn ai-radar`. `-StartWhenAvailable` runs a
+missed Monday at the next boot.
 
 ## ZIP packaging contract
 

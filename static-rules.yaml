@@ -26,6 +26,12 @@ scan_scope:
   # external-API policy runs against prose with fences stripped, so ordinary
   # documentation examples do not trip it.
   markdown_extensions: [.md, .markdown]
+  # A high_confidence hit in one of these documentation files is recorded as
+  # an "exec pattern in docs" (think a README install line: curl ... | sh)
+  # and does NOT reject on its own; the same hit in a script, config, or
+  # SKILL-adjacent code file still does. Empty this list to treat every file
+  # as code again.
+  doc_extensions: [.md, .mdx, .txt, .rst, .adoc, .html]
   max_file_bytes: 2000000
 
 # ---------------------------------------------------------------------------
@@ -479,3 +485,39 @@ allowed_domains:
   - pypi.org
   - crates.io
   - rubygems.org
+
+# ---------------------------------------------------------------------------
+# Audit block (report["audit"]): status, blast radius, needs
+# ---------------------------------------------------------------------------
+# Read by build_audit(); it never changes approved/rejected (fail_on does).
+audit:
+  # high_confidence rules that only spawn a process -- expected for a tool.
+  # A code hit on any OTHER high_confidence rule counts as risky (review).
+  command_rules:
+    [os-system, python-subprocess, node-child-process,
+     powershell-command-switch, powershell-script-file]
+  # Code hits on these mean the artifact reaches files outside its own tree.
+  outside_repo_rules: [ssh-key-access, rm-rf-root]
+  # Binaries a rule hit in code implies, for audit.needs.binaries.
+  rule_binaries:
+    curl-pipe-shell: [curl, sh]
+    wget-pipe-shell: [wget, sh]
+    iwr-pipe-iex: [powershell]
+    invoke-expression: [powershell]
+    powershell-piped-input: [powershell]
+    powershell-command-switch: [powershell]
+    powershell-inline-command: [powershell]
+    powershell-script-file: [powershell]
+    os-system: [python]
+    python-subprocess: [python]
+    node-child-process: [node]
+  # risk_level = sum of the weights of every non-empty blast_radius axis,
+  # then the highest level whose threshold the sum reaches (else low).
+  risk_weights:
+    shell: 2
+    network_hosts: 1
+    credentials_env: 2
+    hooks: 2
+    mcp_servers: 2
+    files_outside_repo: 3
+  risk_levels: {medium: 2, high: 4, critical: 7}
