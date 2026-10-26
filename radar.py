@@ -64,6 +64,10 @@ DELTA_FLAG = 0.05   # roster metric change worth flagging
 SOURCES = ("gittrend", "curatedai", "aa")
 
 
+class MissingCredential(LookupError):
+    """An optional feed was skipped because its API key is absent."""
+
+
 def load_env_file(path: Path) -> None:
     """Same .env convention as skill-scanner.py: the real environment wins."""
     if not path.is_file():
@@ -129,7 +133,7 @@ def fetch_curatedai() -> dict[str, dict]:
 def fetch_aa() -> dict[str, dict]:
     key = os.environ.get(AA_KEY_ENV)
     if not key:
-        raise LookupError(f"skipped: set {AA_KEY_ENV} (free key from the Artificial Analysis Insights Platform)")
+        raise MissingCredential(f"skipped: set {AA_KEY_ENV} (free key from the Artificial Analysis Insights Platform)")
     models = {}
     for m in get_json(AA_URL, headers={"x-api-key": key})["data"]:
         ev, pr = m.get("evaluations") or {}, m.get("pricing") or {}
@@ -371,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
             fetched[src] = fetchers[src]()
             status[src] = f"ok ({len(fetched[src])} items)"
             (snap_dir / f"{src}.json").write_text(json.dumps(fetched[src], indent=1, ensure_ascii=False), encoding="utf-8")
-        except LookupError as exc:
+        except MissingCredential as exc:
             status[src] = str(exc)
         except Exception as exc:  # a failed source never blocks the digest
             status[src] = f"FAILED: {exc}"

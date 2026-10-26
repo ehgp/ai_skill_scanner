@@ -5,7 +5,12 @@
 # ///
 """radar.py diff logic: fixture snapshots -> expected new / rising / gone / roster match."""
 import sys
+import io
+import os
+import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import radar  # noqa: E402
@@ -53,6 +58,24 @@ def main() -> None:
     da = radar.diff_aa({"3": {**models["3"], "intelligence": 60}}, models, ["claude-opus-5-5"])
     assert da["roster"][0]["flag"] and round(da["roster"][0]["deltas"]["intelligence"], 3) == 0.083
     assert {x["slug"] for x in da["new"]} == {"gpt-6-1-sol-low", "gpt-6-1-sol-xhigh"}
+
+    # A malformed source fails the run; an absent optional API credential skips it.
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        with patch.multiple(radar, BASE_DIR=root, RADAR_DIR=root / "radar",
+                            STATE_FILE=root / "radar" / "state.json",
+                            SNAPSHOT_DIR=root / "radar" / "snapshots",
+                            OUT_DIR=root / "reports" / "radar"):
+            with patch.object(radar, "get_json", return_value={"error": "upstream unavailable"}):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    assert radar.main(["--sources", "curatedai"]) == 1
+                assert "curatedai: FAILED: 'tools'" in output.getvalue()
+            with patch.dict(os.environ, {radar.AA_KEY_ENV: ""}):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    assert radar.main(["--sources", "aa"]) == 0
+                assert "aa: skipped: set ARTIFICIAL_ANALYSIS_API_KEY" in output.getvalue()
     print("test_radar: ALL PASS")
 
 
