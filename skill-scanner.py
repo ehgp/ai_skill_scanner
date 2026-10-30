@@ -118,12 +118,16 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
 GENDIGITAL_API = "https://ai.gendigital.com/api/scan/lookup"
 CLAWHUB_DOWNLOAD_BASE = "https://wry-manatee-359.convex.site/api/v1/download"
+# GET /api/v1/skills/{slug}/scan, verified in clawhub.ai/api/v1/openapi.json
+# (2026-10-19). `owner` is not in the spec but is honoured, and is required
+# when several publishers share a slug (bare slug -> 409 AMBIGUOUS_SKILL_SLUG).
+CLAWHUB_SCAN_API = "https://clawhub.ai/api/v1/skills/{slug}/scan"
 
 BASE_DIR = Path(__file__).resolve().parent
 CANDIDATES_DIR = BASE_DIR / "candidates"
@@ -289,6 +293,7 @@ ALL_STAGES = [
     "snyk_agent_scan",
     "snyk_sca",
     "snyk_code",
+    "clawhub_audit",
 ]
 DEFAULT_SCANNERS = {name: True for name in ALL_STAGES}
 
@@ -340,6 +345,27 @@ RULE_GROUPS = (
     "suspicious_context",
     "external_api",
 )
+AUDIT_KEYS = (
+    "command_rules",
+    "outside_repo_rules",
+    "rule_binaries",
+    "risk_weights",
+    "risk_levels",
+)
+
+# Env var names a code file reads through an env API (any name), plus shell
+# `$NAME` / `${NAME}` references that look like credentials. Feeds
+# audit.blast_radius.credentials_env and audit.needs.keys.
+ENV_READ_RE = re.compile(
+    r"""(?:os\.environ(?:\.get)?\s*[\[(]\s*|getenv\s*\(\s*|process\.env\.|"""
+    r"""process\.env\[\s*|Deno\.env\.get\(\s*|\$env:|ENV\[\s*)['"]?([A-Z][A-Z0-9_]{2,})"""
+)
+# A real DNS name or IPv4 - drops template-literal noise like ${host}.
+HOSTNAME_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]+$|^\d{1,3}(?:\.\d{1,3}){3}$")
+SHELL_VAR_RE = re.compile(r"\$\{?([A-Z][A-Z0-9_]{2,})")
+SECRET_NAME_RE = re.compile(
+    r"(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|PAT)(?:_|$)"
+)
 
 
 @dataclass
@@ -365,8 +391,10 @@ class StaticRules:
     allowed_domains: list[str] = field(default_factory=list)
     text_extensions: set[str] = field(default_factory=set)
     markdown_extensions: set[str] = field(default_factory=set)
+    doc_extensions: set[str] = field(default_factory=set)
     max_file_bytes: int = 2_000_000
     disabled_ids: list[str] = field(default_factory=list)
+    audit: dict[str, Any] = field(default_factory=dict)
 
     @property
     def enabled_count(self) -> int:
@@ -446,7 +474,15 @@ def load_static_rules(path: Path = STATIC_RULES_FILE) -> StaticRules:
     rules.markdown_extensions = {
         str(e).lower() for e in (scope.get("markdown_extensions") or [])
     }
+    rules.doc_extensions = {
+        str(e).lower() for e in (scope.get("doc_extensions") or [])
+    }
     rules.max_file_bytes = int(scope.get("max_file_bytes", 2_000_000))
+
+    audit = data.get("audit")
+    if not isinstance(audit, dict) or any(k not in audit for k in AUDIT_KEYS):
+        raise RuntimeError(f"{path}: 'audit' must define {', '.join(AUDIT_KEYS)}.")
+    rules.audit = audit
 
     if not rules.enabled_count:
         raise RuntimeError(
@@ -775,6 +811,9 @@ def clawhub_owner_and_slug(url: str) -> tuple[str | None, str]:
     share a skill name, so the owner must be sent when the URL carries one.
     """
     parts = [p for p in urlparse(url).path.split("/") if p]
+    # Current listing URLs are /owner/skills/slug; older ones /owner/slug.
+    if len(parts) >= 3 and parts[-2] == "skills":
+        return parts[-3], parts[-1]
     if len(parts) >= 2:
         return parts[-2], parts[-1]
     return None, parts[-1] if parts else "skill"
@@ -793,7 +832,12 @@ def make_target(spec: str, source: str) -> Target:
     resolve against the config's home (the script directory).
     """
     if re.match(r"^https?://", spec, flags=re.IGNORECASE):
-        slug = slugify(urlparse(spec).path.rstrip("/").rsplit("/", 1)[-1] or "skill")
+        path = urlparse(spec).path.strip("/")
+        slug = slugify(path.rsplit("/", 1)[-1] or "skill")
+        if is_github(spec) and "/" in path:
+            # github.com/a/skills and github.com/b/skills must not share a
+            # report or an approved/rejected zip: GitHub slugs carry the owner.
+            slug = slugify(path.split("/", 1)[0]) + "__" + slug
         return Target(slug=slug, source=source, url=spec)
 
     path = Path(spec)
@@ -868,14 +912,36 @@ def uniquify_slugs(targets: list[Target]) -> None:
 # ---------------------------------------------------------------------------
 
 
+class DownloadError(RuntimeError):
+    """A download failed for a reason the report should state verbatim."""
+
+
+_rate_limit_printed = False
+
+
 def download_file(url: str, dst: Path) -> Path:
     """Download a file to disk."""
-    with requests.get(
-        url,
-        stream=True,
-        timeout=TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
-    ) as response:
+    global _rate_limit_printed
+    headers = {"User-Agent": USER_AGENT}
+    # Only the API host sees the token (never ClawHub, GenDigital, or
+    # codeload: requests drops Authorization itself on the cross-host redirect
+    # a zipball answers with - Session.rebuild_auth, pinned in tests/).
+    if urlparse(url).netloc.lower() == "api.github.com":
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    with requests.get(url, stream=True, timeout=TIMEOUT, headers=headers) as response:
+        for hop in (*response.history, response):
+            remaining = hop.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and not _rate_limit_printed:
+                _rate_limit_printed = True
+                print(f"GitHub API rate limit: {remaining} request(s) remaining this hour")
+                break
+        if response.status_code in (403, 429) and (
+            "rate limit" in response.text.lower()
+            or response.headers.get("X-RateLimit-Remaining") == "0"
+        ):
+            raise DownloadError("GitHub API rate limit; set GITHUB_TOKEN")
         response.raise_for_status()
         with dst.open("wb") as handle:
             for chunk in response.iter_content(chunk_size=1024 * 128):
@@ -1123,6 +1189,61 @@ def run_gendigital(target: Target) -> StageResult:
     return stage_failed(detail, severity=severity, raw=result)
 
 
+def run_clawhub_audit(target: Target) -> StageResult:
+    """
+    Fetch ClawHub's own security audit for a ClawHub URL into
+    data.registry (surfaced as audit.registry).
+
+    Fail-soft and verdict-neutral: it never returns "failed", so fail_on
+    semantics are unchanged; an unreachable API is a skipped stage.
+    """
+    if not target.url or not is_clawhub(target.url):
+        return stage_skipped("Not a ClawHub URL target.")
+
+    owner, slug = clawhub_owner_and_slug(target.url)
+    try:
+        response = requests.get(
+            CLAWHUB_SCAN_API.format(slug=quote(slug, safe="")),
+            params={"owner": owner} if owner else None,
+            headers={"User-Agent": USER_AGENT},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        return stage_skipped(f"ClawHub audit unavailable: {exc}")
+    if not isinstance(body, dict):
+        return stage_skipped("ClawHub audit unavailable: unexpected response shape.")
+
+    try:
+        registry = clawhub_registry(body, response.url)
+    except (AttributeError, TypeError) as exc:
+        return stage_skipped(f"ClawHub audit unavailable: unexpected response shape ({exc}).")
+    return stage_passed(registry=registry)
+
+
+def clawhub_registry(body: dict[str, Any], endpoint: str) -> dict[str, Any]:
+    """The registry block from a /skills/{slug}/scan response."""
+    security = body.get("security") or {}
+    moderation = body.get("moderation") or {}
+    scanners = security.get("scanners") or {}
+    return {
+        "endpoint": endpoint,
+        # clean | suspicious | malicious | pending | error | None
+        "status": security.get("status"),
+        "has_warnings": security.get("hasWarnings"),
+        "checked_at": security.get("checkedAt"),
+        "version": (body.get("version") or {}).get("version"),
+        "malware_blocked": moderation.get("isMalwareBlocked"),
+        "suspicious": moderation.get("isSuspicious"),
+        "scanners": {
+            name: s.get("normalizedStatus") or s.get("status")
+            for name, s in scanners.items()
+            if isinstance(s, dict)
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Stage: in-house static red flags (URLs, env vars, credentials, payloads)
 # ---------------------------------------------------------------------------
@@ -1167,6 +1288,14 @@ def extract_urls(text: str) -> list[str]:
     return re.findall(r"https?://[^\s)\"'>]+", text, flags=re.IGNORECASE)
 
 
+def url_host(url: str) -> str | None:
+    """Lower-cased host of a URL without userinfo or port; None if unparseable."""
+    try:
+        return urlparse(url).netloc.lower().split("@")[-1].split(":")[0]
+    except ValueError:
+        return None
+
+
 def domain_is_allowed(url: str, rules: StaticRules) -> bool:
     """
     Return True if a URL's host is allowlisted.
@@ -1175,9 +1304,8 @@ def domain_is_allowed(url: str, rules: StaticRules) -> bool:
     "docs.python.org". The dot in the suffix test keeps lookalikes such as
     "evilgithub.com" from matching "github.com".
     """
-    try:
-        netloc = urlparse(url).netloc.lower().split("@")[-1].split(":")[0]
-    except ValueError:
+    netloc = url_host(url)
+    if netloc is None:
         return False
     return any(
         netloc == domain or netloc.endswith(f".{domain}")
@@ -1226,10 +1354,57 @@ def detect_external_api_usage(
                 "file": str(file_path),
                 "pattern": "external_api_dependency",
                 "match": sample[:300],
+                "hosts": sorted(
+                    {h for h in map(url_host, operational_urls) if h and HOSTNAME_RE.match(h)}
+                ),
             }
         )
 
     return findings
+
+
+def declared_requires(skill_md: str) -> dict[str, set[str]]:
+    """
+    Binaries and env vars a SKILL.md frontmatter declares under any nested
+    `requires` key - the ClawHub/OpenClaw convention
+    (metadata: {"clawdbot": {"requires": {"bins": [...], "env": [...]}}}).
+    """
+    match = re.match(r"^---\s*\n(.*?)\n---", skill_md, flags=re.DOTALL)
+    if not match:
+        return {}
+    import yaml  # load_static_rules already required it
+
+    found: dict[str, set[str]] = {"bins": set(), "env": set()}
+    seen: set[int] = set()  # YAML aliases share nodes: visit each once
+
+    def walk(node: Any) -> None:
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node, str) and node.lstrip().startswith("{"):
+            try:
+                node = json.loads(node)
+            except json.JSONDecodeError:
+                return
+        if isinstance(node, dict):
+            req = node.get("requires")
+            if isinstance(req, dict):
+                for key, bucket in (("bins", "bins"), ("anyBins", "bins"), ("env", "env")):
+                    if isinstance(req.get(key), list):
+                        found[bucket].update(str(v) for v in req[key])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    # Frontmatter is untrusted: a self-referencing or deeply nested document
+    # must not take the static stage down with it.
+    try:
+        walk(yaml.safe_load(match.group(1)))
+    except (yaml.YAMLError, RecursionError):
+        return {}
+    return {k: v for k, v in found.items() if v}
 
 
 def run_static_scan(root: Path, rules: StaticRules) -> StageResult:
@@ -1241,7 +1416,11 @@ def run_static_scan(root: Path, rules: StaticRules) -> StageResult:
     third-party APIs / gateways / credential requests. Every pattern comes
     from static-rules.yaml, so operators tune coverage there.
     """
-    findings: list[dict[str, str]] = []
+    findings: list[dict[str, Any]] = []
+    env_names: set[str] = set()
+    code_hosts: set[str] = set()
+    hook_files: list[str] = []
+    declared: dict[str, set[str]] = {}
     files = [root] if root.is_file() else list(root.rglob("*"))
 
     for file_path in files:
@@ -1254,6 +1433,9 @@ def run_static_scan(root: Path, rules: StaticRules) -> StageResult:
 
         # Exec payloads are scanned in the RAW text: Markdown code fences are
         # where instruction-file payloads live, not a false-positive source.
+        # A hit in a documentation file is still recorded, but as an "exec
+        # pattern in docs" (a README install line) rather than a rejection.
+        in_docs = file_path.suffix.lower() in rules.doc_extensions
         for rule in rules.high_confidence:
             for match in rule.regex.finditer(raw_text):
                 findings.append(
@@ -1264,10 +1446,31 @@ def run_static_scan(root: Path, rules: StaticRules) -> StageResult:
                         "file": str(file_path),
                         "pattern": rule.pattern,
                         "match": match.group(0)[:300],
+                        "in_docs": in_docs,
                     }
                 )
 
         findings.extend(detect_external_api_usage(prose_text, file_path, rules))
+
+        # Audit facts (report["audit"]): recorded, never rejecting.
+        rel = file_path.name if file_path == root else file_path.relative_to(root).as_posix()
+        if file_path.name.lower() == "hooks.json" or (
+            file_path.name.lower().startswith("settings")
+            and file_path.suffix.lower() == ".json"
+            and '"hooks"' in raw_text
+        ):
+            hook_files.append(rel)
+        if file_path.name.lower() == "skill.md":
+            for key, values in declared_requires(raw_text).items():
+                declared.setdefault(key, set()).update(values)
+        if not in_docs:
+            code_hosts.update(
+                h for h in map(url_host, extract_urls(raw_text)) if h and HOSTNAME_RE.match(h)
+            )
+            env_names.update(ENV_READ_RE.findall(raw_text))
+            env_names.update(
+                n for n in SHELL_VAR_RE.findall(raw_text) if SECRET_NAME_RE.search(n)
+            )
 
         if file_path.suffix.lower() in rules.markdown_extensions:
             continue
@@ -1300,14 +1503,26 @@ def run_static_scan(root: Path, rules: StaticRules) -> StageResult:
                 }
             )
 
-    if findings:
+    # Every finding stays in `findings`; doc-only exec hits are bucketed
+    # separately and do not reject on their own.
+    in_docs_findings = [f for f in findings if f.get("in_docs")]
+    blocking = [f for f in findings if not f.get("in_docs")]
+    data = {
+        "findings": findings,
+        "exec_patterns_in_docs": in_docs_findings,
+        "env_names": sorted(env_names),
+        "url_hosts_in_code": sorted(code_hosts),
+        "hook_files": sorted(hook_files),
+        "declared_requires": {k: sorted(v) for k, v in declared.items()},
+    }
+    if blocking:
         reasons = [
             f"Static scan {f['type']} [{f.get('rule', '?')}] in {f['file']}: "
             f"{f['match']}"
-            for f in findings
+            for f in blocking
         ]
-        return stage_failed(reasons, findings=findings)
-    return stage_passed(findings=[])
+        return stage_failed(reasons, **data)
+    return stage_passed(**data)
 
 
 # ---------------------------------------------------------------------------
@@ -1909,6 +2124,209 @@ def coverage_notes(stages: dict[str, StageResult]) -> list[str]:
     return notes
 
 
+CREDENTIAL_WORDS = {
+    "API", "APIKEY", "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
+    "CREDENTIAL", "CREDENTIALS", "AUTH", "PAT", "ACCESS", "CLIENT", "PRIVATE",
+}
+
+
+def account_of(env_name: str) -> str:
+    """OPENAI_API_KEY -> "openai"; "" when the name has no service prefix."""
+    # ponytail: naming heuristic; a host->service map is the upgrade if it misleads.
+    prefix: list[str] = []
+    for part in env_name.split("_"):
+        if part in CREDENTIAL_WORDS:
+            break
+        prefix.append(part)
+    return "-".join(prefix).lower()
+
+
+def build_audit(report: dict[str, Any], rules: StaticRules) -> dict[str, Any]:
+    """
+    ClawHub-style summary of a finished report: what to do with it (status),
+    what it can reach (blast_radius -> risk_level) and what it needs.
+
+    Derived only from recorded stage data, so it also works on old reports.
+    It never changes approved/rejected - that stays fail_on's job.
+
+    status: not-scanned (scan errored or no stage ran) > review (risky code,
+    Cisco high+, SkillSpector DO_NOT_INSTALL, Snyk agent issue, secret near
+    network/shell code, SCA vulnerabilities, registry flag) > runs-commands
+    (process spawning in code, exec lines only in docs, Snyk Code findings)
+    > links-only (URLs outside the allowlist, Snyk install errors) > clean.
+    """
+    cfg = rules.audit
+    stages = report.get("stages") or {}
+
+    def data(name: str) -> dict[str, Any]:
+        return (stages.get(name) or {}).get("data") or {}
+
+    def failed(name: str) -> bool:
+        return (stages.get(name) or {}).get("status") == "failed"
+
+    static = data("static")
+    findings = static.get("findings") or []
+
+    def in_docs(f: dict[str, Any]) -> bool:
+        # external_api findings carry no in_docs flag (they block in docs too).
+        return f.get("in_docs", Path(f.get("file", "")).suffix.lower() in rules.doc_extensions)
+
+    def hosts(f: dict[str, Any]) -> list[str]:
+        if "hosts" in f:
+            return f["hosts"]
+        return [url_host(f.get("match", "")) or ""] if f.get("rule") == "external-url" else []
+
+    exec_hits = [f for f in findings if f.get("type") == "high_confidence"]
+    code_exec = sorted({f["rule"] for f in exec_hits if not in_docs(f)})
+    doc_exec = sorted({f["rule"] for f in exec_hits if in_docs(f)})
+    command_rules = set(cfg["command_rules"])
+    risky = [r for r in code_exec if r not in command_rules]
+    commands = [r for r in code_exec if r in command_rules]
+    external = [f for f in findings if f.get("type") == "external_api_dependency"]
+    # Every URL host in code, allowlisted or not; reports older than this
+    # field only know the non-allowlisted ones from external-url findings.
+    code_hosts = static.get("url_hosts_in_code")
+    if code_hosts is None:
+        code_hosts = sorted(
+            {h for f in external if not in_docs(f) for h in hosts(f) if HOSTNAME_RE.match(h)}
+        )
+    doc_hosts = {h for f in external if in_docs(f) for h in hosts(f) if HOSTNAME_RE.match(h)}
+    contextual = sorted(
+        {f["rule"] for f in findings if f.get("type") == "contextual_secret_handling"}
+    )
+
+    review: list[str] = []
+    if risky:
+        review.append("danger-code:" + ",".join(risky))
+    if contextual:
+        review.append("secret-near-net")
+    cisco_high = any(
+        severity_rank(f.get("severity", "")) >= SEVERITY_ORDER["high"]
+        for run in data("cisco").get("runs") or []
+        for f in (run.get("report") or {}).get("findings") or []
+    )
+    if cisco_high:
+        review.append("cisco:high+")
+    if any(
+        str(((run.get("report") or {}).get("risk_assessment") or {}).get("recommendation", "")).upper()
+        == "DO_NOT_INSTALL"
+        for run in data("skillspector").get("runs") or []
+    ):
+        review.append("skillspector:do-not-install")
+    if failed("gendigital"):
+        review.append(f"gendigital:{data('gendigital').get('severity') or 'error'}")
+    if failed("snyk_agent_scan"):
+        review.append("snyk-agent")
+    if failed("snyk_sca") and data("snyk_sca").get("vulnerabilities"):
+        review.append("snyk-sca:vulns")
+    # Cisco/SkillSpector failing below high (or erroring) still failed fail_on.
+    if failed("cisco") and not cisco_high:
+        review.append("cisco:failed")
+    if failed("skillspector") and "skillspector:do-not-install" not in review:
+        review.append("skillspector:failed")
+
+    commands_tier: list[str] = []
+    if commands:
+        commands_tier.append("cmd-code:" + ",".join(commands))
+    if doc_exec:
+        commands_tier.append("exec-doc:" + ",".join(doc_exec))
+    if failed("snyk_code") and data("snyk_code").get("findings"):
+        commands_tier.append("snyk-code")
+
+    links: list[str] = []
+    if external:
+        links.append("external-urls")
+    if failed("snyk_sca") and not data("snyk_sca").get("vulnerabilities"):
+        links.append("snyk-sca-error")
+    if failed("snyk_code") and not data("snyk_code").get("findings"):
+        links.append("snyk-code-error")
+
+    # A rejection nothing above explains (a core scanner or MCP check that
+    # could not run) is a coverage gap: never let it read as clean.
+    if (
+        report.get("status") == "rejected"
+        and not (review or commands_tier or links)
+        and report.get("kind") != "unknown"
+    ):
+        review.append("rejected:coverage")
+
+    ran = any(s.get("status") in ("passed", "failed") for s in stages.values())
+    if report.get("error") or not ran:
+        own_status = "not-scanned"
+    elif review:
+        own_status = "review"
+    elif commands_tier:
+        own_status = "runs-commands"
+    elif links:
+        own_status = "links-only"
+    else:
+        own_status = "clean"
+
+    registry = data("clawhub_audit").get("registry")
+    status = own_status
+    if registry:
+        flagged = bool(
+            registry.get("status") in ("suspicious", "malicious")
+            or registry.get("malware_blocked")
+            or registry.get("suspicious")
+        )
+        registry = dict(registry)
+        registry["disagreement"] = (
+            flagged != (own_status == "review")
+            if registry.get("status") in ("clean", "suspicious", "malicious")
+            and own_status != "not-scanned"
+            else None
+        )
+        if flagged and status != "not-scanned":
+            status = "review"
+            review.append(f"registry:{registry.get('status')}")
+
+    details = report.get("kind_details") or {}
+    mcp = [Path(p).name for p in [details.get("mcp_config_path")] if p]
+    if not mcp and report.get("kind") in ("mcp_config", "mcp_server"):
+        mcp = [report["kind"]]
+    env_names = static.get("env_names") or []
+    blast_radius = {
+        "shell": code_exec,
+        "shell_in_docs": doc_exec,
+        "network_hosts": code_hosts,
+        "doc_link_hosts": len(doc_hosts),
+        "credentials_env": sorted(set(env_names) | {f"rule:{r}" for r in contextual}),
+        "hooks": static.get("hook_files") or [],
+        "mcp_servers": mcp,
+        "files_outside_repo": sorted(set(code_exec) & set(cfg["outside_repo_rules"])),
+    }
+    score = sum(w for axis, w in cfg["risk_weights"].items() if blast_radius.get(axis))
+    risk_level = "low"
+    for level, threshold in sorted(cfg["risk_levels"].items(), key=lambda kv: kv[1]):
+        if score >= threshold:
+            risk_level = level
+
+    declared = static.get("declared_requires") or {}
+    binaries = set(declared.get("bins") or [])
+    for rule in code_exec:
+        binaries.update(cfg["rule_binaries"].get(rule) or [])
+    keys = sorted(
+        {n for n in env_names if SECRET_NAME_RE.search(n)} | set(declared.get("env") or [])
+    )
+    info = ["not-a-skill-package"] if report.get("kind") == "unknown" else []
+
+    return {
+        "status": status,
+        "drivers": review + commands_tier + links + info,
+        "risk_level": risk_level,
+        "risk_score": score,
+        "blast_radius": blast_radius,
+        "needs": {
+            "binaries": sorted(binaries),
+            "keys": keys,
+            "accounts": sorted({account_of(k) for k in keys if SECRET_NAME_RE.search(k)} - {""}),
+        },
+        "scanners": {name: s.get("status") for name, s in stages.items()},
+        "registry": registry,
+    }
+
+
 def copy_to_bucket(src: Path, bucket_dir: Path, name: str) -> Path:
     """Copy a candidate file to an approval/rejection bucket."""
     dest = bucket_dir / name
@@ -1945,6 +2363,7 @@ def scan_target(
         "coverage_notes": [],
         "status": "rejected",
         "failure_reasons": [],
+        "audit": None,
         "stages": {},
         "approved_path": None,
         "rejected_path": None,
@@ -2019,6 +2438,7 @@ def scan_target(
             ),
             "snyk_sca": (run_snyk_sca, (root, snyk_cli, settings)),
             "snyk_code": (run_snyk_code, (root, snyk_cli, settings)),
+            "clawhub_audit": (run_clawhub_audit, (target,)),
         }
         for name in ALL_STAGES:
             if not settings.stage_enabled(name):
@@ -2034,7 +2454,8 @@ def scan_target(
 
     except Exception as exc:  # noqa: BLE001 - every target must yield a report
         report["error"] = str(exc)
-        report["failure_reasons"] = [f"Runtime error: {exc}"]
+        label = "Download failed" if isinstance(exc, DownloadError) else "Runtime error"
+        report["failure_reasons"] = [f"{label}: {exc}"]
         report["status"] = "rejected"
 
     finally:
@@ -2042,6 +2463,8 @@ def scan_target(
         report["duration_seconds"] = round(time.monotonic() - scan_started, 1)
         if not settings.keep_extracted and extract_root.exists():
             shutil.rmtree(extract_root, ignore_errors=True)
+
+    report["audit"] = build_audit(report, rules)
 
     # -- Bucket the ZIP (directory targets are report-only) ------------------
     bucket_name = target.zip_name or (zip_path.name if zip_path else None)
@@ -2224,6 +2647,28 @@ def collect_targets(args: argparse.Namespace) -> tuple[list[Target], dict[str, A
     return targets, yaml_settings
 
 
+def audit_line(audit: dict[str, Any]) -> str:
+    """One console line: status, risk, drivers, needs, registry."""
+    drivers = ", ".join(audit["drivers"]) or "none"
+    needs = "; ".join(
+        f"{k} {', '.join(v[:6])}{' ...' if len(v) > 6 else ''}"
+        for k, v in audit["needs"].items()
+        if v
+    )
+    line = (
+        f"Audit: {audit['status']} | risk {audit['risk_level']} | "
+        f"drivers {drivers[:160]}{'...' if len(drivers) > 160 else ''}"
+    )
+    if needs:
+        line += f" | needs {needs}"
+    if audit.get("registry"):
+        reg = audit["registry"]
+        line += f" | ClawHub {reg.get('status')}"
+        if reg.get("disagreement"):
+            line += " (disagrees)"
+    return line
+
+
 def summary_row(report: dict[str, Any], report_path: Path) -> dict[str, Any]:
     """Build a concise summary entry."""
     skipped = [
@@ -2248,6 +2693,8 @@ def summary_row(report: dict[str, Any], report_path: Path) -> dict[str, Any]:
         "url": report["url"],
         "input_path": report["input_path"],
         "status": report["status"],
+        "audit_status": (report.get("audit") or {}).get("status"),
+        "risk_level": (report.get("audit") or {}).get("risk_level"),
         "duration_seconds": report.get("duration_seconds"),
         "stage_durations": stage_durations,
         "path": report["approved_path"] or report["rejected_path"],
@@ -2382,12 +2829,19 @@ def main() -> None:
 
         print(f"Kind: {report['kind']}")
         print(f"Status: {report['status']}")
+        print(audit_line(report["audit"]))
         print(f"Duration: {report.get('duration_seconds')}s")
         print(f"Report: {report_path}")
 
         row = summary_row(report, report_path)
         if row["disabled_stages"]:
             print(f"  (disabled) {', '.join(row['disabled_stages'])}")
+        static_data = report["stages"].get("static", {}).get("data", {})
+        if static_data.get("exec_patterns_in_docs"):
+            print(
+                f"  (docs) {len(static_data['exec_patterns_in_docs'])} exec pattern(s) "
+                "in documentation files - recorded, not rejecting"
+            )
         if report["status"] == "approved":
             summary["approved"].append(row)
             for note in row["skipped_stages"]:
